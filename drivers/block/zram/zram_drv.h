@@ -19,7 +19,6 @@
 #include <linux/zsmalloc.h>
 #include <linux/crypto.h>
 #include <linux/list_lru.h>
-#include <linux/percpu_counter.h>
 
 #include "zcomp.h"
 
@@ -59,9 +58,6 @@ enum zram_pageflags {
 	ZRAM_COMP_PRIORITY_BIT1, /* First bit of comp priority index */
 	ZRAM_COMP_PRIORITY_BIT2, /* Second bit of comp priority index */
 
-	ZRAM_REFERENCED, /* Page was referenced since last shrinker scan */
-	ZRAM_ACTIVE, /* Page is in active list (percpu_pagevec or active_list) */
-
 	__NR_ZRAM_PAGEFLAGS,
 };
 
@@ -69,6 +65,7 @@ enum zram_pageflags {
 
 /* Allocated for each disk page */
 struct zram_table_entry {
+
 	unsigned long handle;
 	unsigned long flags;
 #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
@@ -76,45 +73,34 @@ struct zram_table_entry {
 #endif
 #ifdef	CONFIG_ZRAM_WRITEBACK
 	struct list_head lru;
+	bool referenced;
 #endif
 };
 
 #ifdef CONFIG_ZRAM_WRITEBACK
-#define BATCH_SIZE 32
-#define WINDOW_RADIUS 8
-#define MIN_AGGREGATE 4
-#define ZRAM_PAGEVEC_SIZE 128
-struct zram_pagevec {
-	spinlock_t lock;  /* 使用标准自旋锁以支持跨 CPU drain */
-	unsigned long indices[ZRAM_PAGEVEC_SIZE];
-	int nr;
-};
-
-struct zram_shrink_work {
-    struct zram *zram;
-    unsigned long candidates[BATCH_SIZE]; /* 候选页面索引数组 */
-    int nr_candidates;                    /* 当前收集数量 */
-    struct zram_pp_ctl *ctl;              /* 写回控制器 */
+struct zram_shrink_ctx {
+	struct zram *zram;
+	struct zram_pp_ctl *ctl;
 };
 #endif
 
 struct zram_stats {
-	struct percpu_counter compr_data_size;	/* compressed size of pages stored */
+	atomic64_t compr_data_size;	/* compressed size of pages stored */
 	atomic64_t failed_reads;	/* can happen when memory is too low */
 	atomic64_t failed_writes;	/* can happen when memory is too low */
-	struct percpu_counter notify_free;	/* no. of swap slot free notifications */
-	struct percpu_counter same_pages;		/* no. of same element filled pages */
-	struct percpu_counter huge_pages;		/* no. of huge pages */
-	struct percpu_counter huge_pages_since;	/* no. of huge pages since zram set up */
-	struct percpu_counter pages_stored;	/* no. of pages currently stored */
+	atomic64_t notify_free;	/* no. of swap slot free notifications */
+	atomic64_t same_pages;		/* no. of same element filled pages */
+	atomic64_t huge_pages;		/* no. of huge pages */
+	atomic64_t huge_pages_since;	/* no. of huge pages since zram set up */
+	atomic64_t pages_stored;	/* no. of pages currently stored */
 	atomic_long_t max_used_pages;	/* no. of maximum pages stored */
 	atomic64_t writestall;		/* no. of write slow paths */
 	atomic64_t miss_free;		/* no. of missed free */
 #ifdef	CONFIG_ZRAM_WRITEBACK
-	struct percpu_counter bd_count;		/* no. of pages in backing device */
-	struct percpu_counter bd_reads;		/* no. of reads from backing device */
-	struct percpu_counter bd_writes;		/* no. of writes from backing device */
-	struct percpu_counter written_back_pages;
+	atomic64_t bd_count;		/* no. of pages in backing device */
+	atomic64_t bd_reads;		/* no. of reads from backing device */
+	atomic64_t bd_writes;		/* no. of writes from backing device */
+    atomic64_t written_back_pages;
 	atomic64_t reject_reclaim_fail;
 #endif
 };
@@ -153,7 +139,6 @@ struct zram {
 	 * zram is claimed so open request will be failed
 	 */
 	bool claim; /* Protected by disk->open_mutex */
-	mempool_t *io_page_pool;
 #ifdef CONFIG_ZRAM_WRITEBACK
 	struct file *backing_dev;
 	spinlock_t wb_limit_lock;
@@ -162,18 +147,9 @@ struct zram {
 	struct block_device *bdev;
 	unsigned long *bitmap;
 	unsigned long nr_pages;
-	spinlock_t bitmap_lock;  /* 保护 bitmap 的分配与释放 */
-	unsigned long bitmap_last_free_hint;
 	struct shrinker *zram_shrinker;
 	/* Global LRU list for zram entries. */
 	struct list_lru zram_list_lru;
-	mempool_t *wb_page_pool;
-	unsigned long shrinker_active_start;
-	atomic_t shrinker_in_active_period;
-	struct zram_pagevec __percpu *active_pagevecs;
-	struct list_head active_list;
-	spinlock_t active_list_lock;
-	atomic_long_t active_pages;  /* 实时追踪活跃链表长度 */
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
@@ -191,7 +167,6 @@ void zram_slot_unlock(struct zram *zram, u32 index);
 void zram_set_handle(struct zram *zram, u32 index, unsigned long handle);
 bool zram_test_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
 void zram_set_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
-void zram_clear_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
 void zram_free_page(struct zram *zram, size_t index);
 
 #if defined CONFIG_ZRAM_WRITEBACK || defined CONFIG_ZRAM_MULTI_COMP
@@ -211,7 +186,6 @@ struct zram_pp_ctl {
 	struct list_head	pp_buckets[NUM_PP_BUCKETS];
 	struct completion	all_done;
 	atomic_t		num_pp_slots;
-	unsigned long		deadline_jiffies;  /* 时间限制截止时间 */
 };
 
 void free_pp_slot(struct zram *zram, struct zram_pp_slot *pps);

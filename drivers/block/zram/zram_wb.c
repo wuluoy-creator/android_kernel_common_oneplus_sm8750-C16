@@ -18,217 +18,116 @@ static struct zram_wb_request_list wb_req_list;
 static struct bio_set zram_wb_bs;
 
 /* 
- * front_pad: 在 bio 结构之前预留空间存放 zram_wb_batch_request
- * 这个结构现在比较大 (包含数组)，必须确保 bio 对齐
+ * front_pad: 在 bio 结构之前预留空间存放 zram_wb_request
+ * 需要对齐以保证 bio 结构的正确对齐
  */
 #define ZRAM_WB_FRONT_PAD \
-	roundup(sizeof(struct zram_wb_batch_request), __alignof__(struct bio))
+	roundup(sizeof(struct zram_wb_request), __alignof__(struct bio))
 
 /*
- * 从 bio 指针获取其前面的 zram_wb_batch_request 结构
+ * 从 bio 指针获取其前面的 zram_wb_request 结构
+ * bio 分配时在其前面预留了 ZRAM_WB_FRONT_PAD 字节
  */
-#define bio_to_wb_batch(bio) \
-	((struct zram_wb_batch_request *)((char *)(bio) - ZRAM_WB_FRONT_PAD))
+#define bio_to_zram_wb_request(bio) \
+	((struct zram_wb_request *)((char *)(bio) - ZRAM_WB_FRONT_PAD))
 
-/* 
- * 内部辅助函数：分配指定长度的连续区间
- * 使用 spinlock 保护，避免批量分配时的 retry 风暴
- * 返回值：成功返回起始索引，失败返回 0
- */
-static unsigned long alloc_block_bdev_range(struct zram *zram, int count)
+unsigned long alloc_block_bdev(struct zram *zram)
 {
-	unsigned long blk_idx;
-	unsigned long align_mask = (unsigned long)count - 1;
+	unsigned long blk_idx = 1;
+retry:
+	/* skip 0 bit to confuse zram.handle = 0 */
+	blk_idx = find_next_zero_bit(zram->bitmap, zram->nr_pages, blk_idx);
+	if (blk_idx == zram->nr_pages)
+		return 0;
 
-	spin_lock(&zram->bitmap_lock);
+	if (test_and_set_bit(blk_idx, zram->bitmap))
+		goto retry;
 
-	blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
-					     zram->bitmap_last_free_hint, count, align_mask);
-
-	if (blk_idx >= zram->nr_pages && zram->bitmap_last_free_hint > 0) {
-		blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
-						     1, count, align_mask);
-	}
-
-	if (blk_idx < zram->nr_pages) {
-		bitmap_set(zram->bitmap, blk_idx, count);
-		zram->bitmap_last_free_hint = blk_idx + count;
-	} else {
-		blk_idx = 0;
-	}
-
-	spin_unlock(&zram->bitmap_lock);
-
-	if (blk_idx)
-		percpu_counter_add(&zram->stats.bd_count, count);
-
+	atomic64_inc(&zram->stats.bd_count);
 	return blk_idx;
 }
 
-/*
- * 实现 TODO 1.2: 分配降级策略（优化版）
- * 
- * 修复：避免碎片化严重时进行多次全位图扫描
- * 原策略：尝试 64, 32, 16, 8, 4, 2, 1 共7次扫描
- * 新策略：只尝试最优情况(请求的大小)和保底情况(1块)
- * 
- * req_count: 请求分配的块数 (例如 64)
- * act_count: 输出参数，实际分配的块数
- */
-unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_count)
-{
-    unsigned long blk_idx = 0;
-
-    if (req_count <= 1) {
-        blk_idx = alloc_block_bdev_range(zram, 1);
-        if (blk_idx) {
-            if (act_count) *act_count = 1;
-            return blk_idx;
-        }
-        if (act_count) *act_count = 0;
-        return 0;
-    }
-
-    blk_idx = alloc_block_bdev_range(zram, req_count);
-    if (blk_idx) {
-        if (act_count) *act_count = req_count;
-        return blk_idx;
-    }
-
-    blk_idx = alloc_block_bdev_range(zram, 1);
-    if (blk_idx) {
-        if (act_count) *act_count = 1;
-        return blk_idx;
-    }
-
-    if (act_count) *act_count = 0;
-    return 0;
-}
-
-/* 保持原有单块分配函数的兼容性 */
-unsigned long alloc_block_bdev(struct zram *zram)
-{
-	int count = 0;
-	return alloc_block_bdev_batch(zram, 1, &count);
-}
-
-/* 批量释放辅助函数，使用 spinlock 保护 */
-void free_block_bdev_range(struct zram *zram, unsigned long blk_idx, int count)
-{
-	spin_lock(&zram->bitmap_lock);
-	bitmap_clear(zram->bitmap, blk_idx, count);
-	if (blk_idx < zram->bitmap_last_free_hint)
-		zram->bitmap_last_free_hint = blk_idx;
-	spin_unlock(&zram->bitmap_lock);
-
-	percpu_counter_sub(&zram->stats.bd_count, count);
-}
-
-/* 保持原有单块释放函数的兼容性 */
 void free_block_bdev(struct zram *zram, unsigned long blk_idx)
 {
-	free_block_bdev_range(zram, blk_idx, 1);
+	int was_set;
+
+	was_set = test_and_clear_bit(blk_idx, zram->bitmap);
+	WARN_ON_ONCE(!was_set);
+	atomic64_dec(&zram->stats.bd_count);
 }
 
-
-/*
- * 处理完成的 BIO 批次
- * 这是一个核心函数，负责批量释放资源
- */
-static void complete_wb_batch(struct zram_wb_batch_request *req)
+static void complete_wb_request(struct zram_wb_request *req)
 {
 	struct zram *zram = req->zram;
+	struct zram_pp_slot *pps = req->pps;
 	struct zram_pp_ctl *ctl = req->ppctl;
+	unsigned long index = pps->index;
+	unsigned long blk_idx = req->blk_idx;
 	struct bio *bio = req->bio;
-	bool io_error = bio->bi_status != BLK_STS_OK;
-	int i;
 
-	/* 遍历批次中的每一个子请求 */
-	for (i = 0; i < req->count; i++) {
-		struct zram_wb_sub_req *sub = &req->sub_reqs[i];
-		unsigned long index = sub->index;
-		unsigned long blk_idx = sub->blk_idx;
-		struct zram_pp_slot *pps = sub->pps;
+	if (bio->bi_status)
+		goto out_err;
 
-		if (io_error)
-			goto handle_err;
-
-		/* 更新统计 */
-		percpu_counter_inc(&zram->stats.bd_writes);
-		spin_lock(&zram->wb_limit_lock);
-
-		/* 锁定槽位进行状态变更 */
-		zram_slot_lock(zram, index);
-		if (!zram_test_flag(zram, index, ZRAM_PP_SLOT)) {
-			zram_slot_unlock(zram, index);
-			spin_unlock(&zram->wb_limit_lock);
-			goto handle_err;
-		}
-
-		/* 成功路径：释放内存页，设置写回标志 */
-		zram_free_page(zram, index);
-		zram_set_flag(zram, index, ZRAM_WB);
-		zram_set_handle(zram, index, blk_idx);
-		percpu_counter_inc(&zram->stats.pages_stored);
-
-		/* 更新写回限制配额 */
-		if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
-			zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
-
-		zram_clear_flag(zram, index, ZRAM_PP_SLOT);
-		zram_slot_unlock(zram, index);
-		spin_unlock(&zram->wb_limit_lock);
-		
-		kfree(pps);
-		continue;
-
-handle_err:
-		/* 失败路径：回滚块分配，保留 ZRAM 内存页 */
-		free_block_bdev(zram, blk_idx);
-		free_pp_slot(zram, pps);
-	}
+	atomic64_inc(&zram->stats.bd_writes);
+	zram_slot_lock(zram, index);
 
 	/*
-	 * 重要：ctl->num_pp_slots 记录了待处理的总数
-	 * 此时减少当前批次处理的数量 (req->count)
-	 * 异步 Shrinker 模式下 ctl 为 NULL。
+	 * We release slot lock during writeback so slot can change
+	 * under us: slot_free() or slot_free() and reallocation
+	 * (zram_write_page()). In both cases slot loses
+	 * ZRAM_PP_SLOT flag. No concurrent post-processing can set
+	 * ZRAM_PP_SLOT on such slots until current post-processing
+	 * finishes.
 	 */
-	if (ctl) {
-		if (atomic_sub_and_test(req->count, &ctl->num_pp_slots))
-			complete(&ctl->all_done);
+	if (!zram_test_flag(zram, index, ZRAM_PP_SLOT)) {
+		zram_slot_unlock(zram, index);
+		goto out_err;
 	}
 
-	/* 释放 BIO 及其挂载的所有 pages */
-	{
-		struct bio_vec *bv;
-		struct bvec_iter_all iter;
+	zram_free_page(zram, index);
+	zram_set_flag(zram, index, ZRAM_WB);
+	zram_set_handle(zram, index, blk_idx);
+	atomic64_inc(&zram->stats.pages_stored);
+	spin_lock(&zram->wb_limit_lock);
+	if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
+		zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
+	spin_unlock(&zram->wb_limit_lock);
+	zram_slot_unlock(zram, index);
+	goto end;
 
-		bio_for_each_segment_all(bv, bio, iter) {
-			mempool_free(bv->bv_page, zram->wb_page_pool);
-		}
-		/* bio_put 会释放 bio 内存以及 front_pad */
-		bio_put(bio);
-	}
+out_err:
+	free_block_bdev(zram, blk_idx);
+end:
+	free_pp_slot(zram, pps);
+	free_wb_request(req);
+
+	if (atomic_dec_and_test(&ctl->num_pp_slots))
+		complete(&ctl->all_done);
 }
 
 static void enqueue_wb_request(struct zram_wb_request_list *req_list,
-			       struct zram_wb_batch_request *req)
+			       struct zram_wb_request *req)
 {
+	/*
+	 * The enqueue path comes from softirq context:
+	 * blk_done_softirq -> bio_endio -> zram_writeback_end_io
+	 * Use spin_lock_bh for locking.
+	 */
 	spin_lock_bh(&req_list->lock);
 	list_add_tail(&req->node, &req_list->head);
 	req_list->count++;
 	spin_unlock_bh(&req_list->lock);
 }
 
-static struct zram_wb_batch_request *dequeue_wb_request(
+static struct zram_wb_request *dequeue_wb_request(
 	struct zram_wb_request_list *req_list)
 {
-	struct zram_wb_batch_request *req = NULL;
+	struct zram_wb_request *req = NULL;
 
 	spin_lock_bh(&req_list->lock);
 	if (!list_empty(&req_list->head)) {
 		req = list_first_entry(&req_list->head,
-				       struct zram_wb_batch_request,
+				       struct zram_wb_request,
 				       node);
 		list_del(&req->node);
 		req_list->count--;
@@ -240,107 +139,123 @@ static struct zram_wb_batch_request *dequeue_wb_request(
 
 static void destroy_wb_request_list(struct zram_wb_request_list *req_list)
 {
-	struct zram_wb_batch_request *req;
+	struct zram_wb_request *req;
 
 	while (!list_empty(&req_list->head)) {
 		req = dequeue_wb_request(req_list);
-		int i;
-		for(i = 0; i < req->count; i++) {
-			free_block_bdev(req->zram, req->sub_reqs[i].blk_idx);
-			free_pp_slot(req->zram, req->sub_reqs[i].pps);
-		}
-		
-		/* Free pages and bio */
-		struct bio_vec *bv;
-		struct bvec_iter_all iter;
-		bio_for_each_segment_all(bv, req->bio, iter) {
-			mempool_free(bv->bv_page, req->zram->wb_page_pool);
-		}
-		bio_put(req->bio);
+		free_block_bdev(req->zram, req->blk_idx);
+		free_pp_slot(req->zram, req->pps);
+		free_wb_request(req);
 	}
 }
 
 static bool wb_ready_to_run(void)
 {
 	int count;
+
 	spin_lock_bh(&wb_req_list.lock);
 	count = wb_req_list.count;
 	spin_unlock_bh(&wb_req_list.lock);
+
 	return count > 0;
 }
 
 static int wb_thread_func(void *data)
 {
-	unsigned int nofs_flags;
-
 	set_freezable();
-	nofs_flags = memalloc_noreclaim_save();
 
 	while (!kthread_should_stop()) {
-		wait_event_freezable(wb_wq, wb_ready_to_run() || kthread_should_stop());
+		wait_event_freezable(wb_wq, wb_ready_to_run());
 
 		while (1) {
-			struct zram_wb_batch_request *req;
+			struct zram_wb_request *req;
+
 			req = dequeue_wb_request(&wb_req_list);
 			if (!req)
 				break;
-			complete_wb_batch(req);
+			complete_wb_request(req);
 		}
 	}
-
-	memalloc_noreclaim_restore(nofs_flags);
 	return 0;
 }
 
 static void zram_writeback_end_io(struct bio *bio)
 {
-	struct zram_wb_batch_request *req = bio_to_wb_batch(bio);
+	struct zram_wb_request *req = bio_to_zram_wb_request(bio);
+
 	enqueue_wb_request(&wb_req_list, req);
 	wake_up(&wb_wq);
 }
 
-/*
- * 外部接口：分配一个新的批次请求
- */
-struct zram_wb_batch_request *alloc_wb_batch_request(struct zram *zram,
-						     struct zram_pp_ctl *ctl,
-						     unsigned long start_blk_idx,
-						     gfp_t gfp_mask)
+struct zram_wb_request *alloc_wb_request(struct zram *zram,
+					 struct zram_pp_slot *pps,
+					 struct zram_pp_ctl *ppctl,
+					 unsigned long blk_idx)
 {
+	struct zram_wb_request *req;
+	struct page *page;
 	struct bio *bio;
-	struct zram_wb_batch_request *req;
+	int err = 0;
+
+	page = alloc_page(GFP_NOIO | __GFP_NOWARN);
+	if (!page)
+		return ERR_PTR(-ENOMEM);
 
 	/*
-	 * 使用 bioset 分配 bio。
-	 * ZRAM_WB_MAX_BATCH_SIZE 定义了 bio_vec 的最大数量。
-	 * front_pad 会自动被 bio_alloc 分配在 bio 之前。
+	 * 使用 bioset 分配 bio,front_pad 空间会被自动分配在 bio 之前
+	 * 需要 BIOSET_NEED_BVECS 标志,因为我们手动添加 page
 	 */
-	bio = bio_alloc_bioset(zram->bdev, ZRAM_WB_MAX_BATCH_SIZE,
-			       REQ_OP_WRITE, gfp_mask,
+	bio = bio_alloc_bioset(zram->bdev, 1, REQ_OP_WRITE, GFP_NOIO,
 			       &zram_wb_bs);
-	if (!bio)
-		return NULL;
+	if (!bio) {
+		err = -ENOMEM;
+		goto out_free_page;
+	}
 
-	/* 获取前面预留的结构体 */
-	req = bio_to_wb_batch(bio);
+	/* 通过宏访问 bio 前面的 zram_wb_request 结构 */
+	req = bio_to_zram_wb_request(bio);
 	req->zram = zram;
-	req->ppctl = ctl;
+	req->pps = pps;
+	req->ppctl = ppctl;
+	req->blk_idx = blk_idx;
 	req->bio = bio;
-	req->count = 0; /* 初始计数为 0 */
 
-	/* 设置 bio 的起始扇区和回调 */
-	bio->bi_iter.bi_sector = start_blk_idx * (PAGE_SIZE >> 9);
+	bio->bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
+	__bio_add_page(bio, page, PAGE_SIZE, 0);
 	bio->bi_end_io = zram_writeback_end_io;
-	
 	return req;
+
+out_free_page:
+	__free_page(page);
+	return ERR_PTR(err);
+}
+
+void free_wb_request(struct zram_wb_request *req)
+{
+	struct bio *bio = req->bio;
+	struct page *page = bio_first_page_all(bio);
+
+	if (page)
+		__free_page(page);
+	/*
+	 * bio_put 会自动释放 bio 以及其 front_pad 空间
+	 * 不需要单独释放 req
+	 */
+	bio_put(bio);
 }
 
 int setup_zram_writeback(void)
 {
 	/*
 	 * 初始化 bioset:
-	 * pool_size: 64 (缓冲池大小)
-	 * front_pad: ZRAM_WB_FRONT_PAD (包含我们的 zram_wb_batch_request)
+	 * - pool_size: 64,预分配的 bio 数量,用于减少分配开销
+	 * - front_pad: ZRAM_WB_FRONT_PAD,在每个 bio 之前预留空间
+	 * - flags: BIOSET_NEED_BVECS,需要 bio vecs 支持
+	 * 
+	 * 参考 dm-table.c 的做法,使用 front_pad 可以:
+	 * 1. 避免为 zram_wb_request 单独分配内存
+	 * 2. 提高缓存局部性(request 和 bio 内存连续)
+	 * 3. 简化内存管理(一起分配一起释放)
 	 */
 	if (bioset_init(&zram_wb_bs, 64, ZRAM_WB_FRONT_PAD, BIOSET_NEED_BVECS)) {
 		pr_err("Unable to init zram_wb_bs\n");
@@ -362,8 +277,7 @@ int setup_zram_writeback(void)
 
 void destroy_zram_writeback(void)
 {
-	if (wb_thread)
-		kthread_stop(wb_thread);
+	kthread_stop(wb_thread);
 	destroy_wb_request_list(&wb_req_list);
 	bioset_exit(&zram_wb_bs);
 }
